@@ -11,6 +11,7 @@ a deeper understanding of the internal workings of transformers like GPT-2.
 
 import logging
 import os
+from collections.abc import Generator
 from typing import (
     Dict,
     List,
@@ -23,7 +24,6 @@ from typing import (
     cast,
     overload,
 )
-from collections.abc import Generator
 
 import einops
 import numpy as np
@@ -395,8 +395,7 @@ class HookedTransformer(HookedRootModule):
         attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
         stop_at_layer: Optional[int] = None,
         past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
-    ) -> Loss:
-        ...
+    ) -> Loss: ...
 
     @overload
     def forward(
@@ -412,8 +411,7 @@ class HookedTransformer(HookedRootModule):
         attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
         stop_at_layer: Optional[int] = None,
         past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
-    ) -> Loss:
-        ...
+    ) -> Loss: ...
 
     @overload
     def forward(
@@ -429,8 +427,7 @@ class HookedTransformer(HookedRootModule):
         attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
         stop_at_layer: Optional[int] = None,
         past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
-    ) -> Tuple[Float[torch.Tensor, "batch pos d_vocab"], Loss]:
-        ...
+    ) -> Tuple[Float[torch.Tensor, "batch pos d_vocab"], Loss]: ...
 
     @overload
     def forward(
@@ -446,8 +443,7 @@ class HookedTransformer(HookedRootModule):
         attention_mask: Optional[torch.Tensor] = None,  # [batch pos]
         stop_at_layer: Optional[int] = None,
         past_kv_cache: Optional[HookedTransformerKeyValueCache] = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     def forward(
         self,
@@ -629,14 +625,12 @@ class HookedTransformer(HookedRootModule):
     @overload
     def run_with_cache(
         self, *model_args, return_cache_object: Literal[True] = True, **kwargs
-    ) -> Tuple[Output, ActivationCache]:
-        ...
+    ) -> Tuple[Output, ActivationCache]: ...
 
     @overload
     def run_with_cache(
         self, *model_args, return_cache_object: Literal[False], **kwargs
-    ) -> Tuple[Output, Dict[str, torch.Tensor]]:
-        ...
+    ) -> Tuple[Output, Dict[str, torch.Tensor]]: ...
 
     def run_with_cache(
         self, *model_args, return_cache_object=True, remove_batch_dim=False, **kwargs
@@ -2234,6 +2228,7 @@ class HookedTransformer(HookedRootModule):
         self,
         input: Union[str, Float[torch.Tensor, "batch pos"]] = "",
         max_new_tokens: int = 10,
+        max_tokens_per_yield: int = 25,
         stop_at_eos: bool = True,
         eos_token_id: Optional[int] = None,
         do_sample: bool = True,
@@ -2417,15 +2412,33 @@ class HookedTransformer(HookedRootModule):
 
                 new_tokens = sampled_tokens.unsqueeze(-1)
 
+                # Accumulate tokens until we hit max_tokens_per_yield
                 if index == 0:
-                    yield torch.cat([tokens, new_tokens], dim=-1)
+                    accumulated_tokens = torch.cat([tokens, new_tokens], dim=-1)
+                    tokens_since_last_yield = accumulated_tokens.shape[1]
                 else:
-                    yield new_tokens
+                    if accumulated_tokens is None:
+                        accumulated_tokens = new_tokens
+                    else:
+                        accumulated_tokens = torch.cat([accumulated_tokens, new_tokens], dim=-1)
+                    tokens_since_last_yield += 1
+
+                if tokens_since_last_yield >= max_tokens_per_yield:
+                    yield accumulated_tokens
+                    tokens_since_last_yield = 0
+                    accumulated_tokens = None
 
                 tokens = torch.cat([tokens, new_tokens], dim=-1)
 
                 if stop_at_eos and finished_sequences.all():
+                    # Yield any remaining accumulated tokens before breaking
+                    if accumulated_tokens is not None:
+                        yield accumulated_tokens
                     break
+
+            # Only yield remaining tokens if we didn't already yield them in the break case
+            if accumulated_tokens is not None and not (stop_at_eos and finished_sequences.all()):
+                yield accumulated_tokens
 
             if return_type == "str":
                 if self.cfg.default_prepend_bos:
