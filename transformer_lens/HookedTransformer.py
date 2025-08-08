@@ -2241,6 +2241,7 @@ class HookedTransformer(HookedRootModule):
         padding_side: Optional[Literal["left", "right"]] = USE_DEFAULT_VALUE,
         return_type: Optional[str] = "input",
         verbose: bool = True,
+        return_logits: bool = False,
     ) -> Generator[Union[Int[torch.Tensor, "batch"], str], None, None]:
         """Sample Tokens from the Model.
 
@@ -2286,6 +2287,11 @@ class HookedTransformer(HookedRootModule):
             return_type (Optional[str]): The type of the output to return - either a string (str),
                 a tensor of tokens (tensor) or whatever the format of the input was (input).
             verbose (bool): If True, show tqdm progress bars for generation.
+            return_logits (bool): If True, also yield the logits corresponding to the newly
+                generated tokens. When enabled, yields tuples of the form
+                (accumulated_tokens, accumulated_logits), where accumulated_tokens matches the
+                existing behavior and accumulated_logits has shape [batch, num_new_tokens, d_vocab]
+                for the tokens generated since the last yield.
 
         Returns:
             outputs (torch.Tensor): [batch, pos + max_new_tokens], generated sequence of new tokens
@@ -2412,19 +2418,34 @@ class HookedTransformer(HookedRootModule):
 
                 new_tokens = sampled_tokens.unsqueeze(-1)
 
+                # Track logits for the newly generated tokens if requested
+                if return_logits:
+                    new_logits = final_logits.unsqueeze(1)
+
                 # Accumulate tokens until we hit max_tokens_per_yield
                 if index == 0:
                     accumulated_tokens = torch.cat([tokens, new_tokens], dim=-1)
                     tokens_since_last_yield = accumulated_tokens.shape[1]
+                    if return_logits:
+                        accumulated_logits = new_logits
                 else:
                     if accumulated_tokens is None:
                         accumulated_tokens = new_tokens
                     else:
                         accumulated_tokens = torch.cat([accumulated_tokens, new_tokens], dim=-1)
                     tokens_since_last_yield += 1
+                    if return_logits:
+                        if "accumulated_logits" not in locals() or accumulated_logits is None:
+                            accumulated_logits = new_logits
+                        else:
+                            accumulated_logits = torch.cat([accumulated_logits, new_logits], dim=1)
 
                 if tokens_since_last_yield >= max_tokens_per_yield:
-                    yield accumulated_tokens
+                    if return_logits:
+                        yield (accumulated_tokens, accumulated_logits)
+                        accumulated_logits = None
+                    else:
+                        yield accumulated_tokens
                     tokens_since_last_yield = 0
                     accumulated_tokens = None
 
@@ -2433,12 +2454,19 @@ class HookedTransformer(HookedRootModule):
                 if stop_at_eos and finished_sequences.all():
                     # Yield any remaining accumulated tokens before breaking
                     if accumulated_tokens is not None:
-                        yield accumulated_tokens
+                        if return_logits:
+                            yield (accumulated_tokens, accumulated_logits)
+                            accumulated_logits = None
+                        else:
+                            yield accumulated_tokens
                     break
 
             # Only yield remaining tokens if we didn't already yield them in the break case
             if accumulated_tokens is not None and not (stop_at_eos and finished_sequences.all()):
-                yield accumulated_tokens
+                if return_logits:
+                    yield (accumulated_tokens, accumulated_logits)
+                else:
+                    yield accumulated_tokens
 
             if return_type == "str":
                 if self.cfg.default_prepend_bos:
