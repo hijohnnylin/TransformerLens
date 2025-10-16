@@ -4,11 +4,13 @@ This module provides the bridge components that wrap remote model components and
 a consistent interface for accessing their weights and performing operations.
 """
 
+from threading import Thread
 from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
     Dict,
+    Generator,
     Iterator,
     List,
     Literal,
@@ -76,9 +78,9 @@ class TransformerBridge(nn.Module):
         self.tokenizer = tokenizer
         self.compatibility_mode = False
         self._hook_cache = None  # Cache for hook discovery results
-        self._hook_registry: Dict[
-            str, HookPoint
-        ] = {}  # Dynamic registry of hook names to HookPoints
+        self._hook_registry: Dict[str, HookPoint] = (
+            {}
+        )  # Dynamic registry of hook names to HookPoints
         self._hook_registry_initialized = False  # Track if registry has been initialized
 
         # Add device information to config from the loaded model
@@ -997,8 +999,7 @@ class TransformerBridge(nn.Module):
         return_cache_object: Literal[True] = True,
         remove_batch_dim: bool = False,
         **kwargs,
-    ) -> Tuple[Any, ActivationCache]:
-        ...
+    ) -> Tuple[Any, ActivationCache]: ...
 
     @overload
     def run_with_cache(
@@ -1007,8 +1008,7 @@ class TransformerBridge(nn.Module):
         return_cache_object: Literal[False],
         remove_batch_dim: bool = False,
         **kwargs,
-    ) -> Tuple[Any, Dict[str, torch.Tensor]]:
-        ...
+    ) -> Tuple[Any, Dict[str, torch.Tensor]]: ...
 
     def run_with_cache(
         self,
@@ -1578,6 +1578,374 @@ class TransformerBridge(nn.Module):
                 return output_tokens
             else:
                 return output_tokens
+
+    def generate_stream(
+        self,
+        input: Union[str, List[str], torch.Tensor] = "",
+        max_new_tokens: int = 10,
+        max_tokens_per_yield: int = 25,
+        stop_at_eos: bool = True,
+        eos_token_id: Optional[int] = None,
+        do_sample: bool = True,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        temperature: float = 1.0,
+        freq_penalty: float = 0.0,
+        use_past_kv_cache: bool = True,
+        prepend_bos: Optional[bool] = None,
+        padding_side: Optional[str] = None,
+        return_type: Optional[str] = "input",
+        verbose: bool = True,
+        return_logits: bool = False,
+    ) -> Generator[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], None, None]:
+        """Generate text from the model with streaming output.
+
+        This method generates tokens one at a time and yields them in batches, allowing
+        for real-time streaming of generated text.
+
+        Args:
+            input: Input prompt
+            max_new_tokens: Maximum number of tokens to generate
+            max_tokens_per_yield: Number of tokens to accumulate before yielding
+            stop_at_eos: Whether to stop at EOS token
+            eos_token_id: EOS token ID
+            do_sample: Whether to sample from distribution
+            top_k: Top-k sampling parameter
+            top_p: Top-p sampling parameter
+            temperature: Sampling temperature
+            freq_penalty: Frequency penalty (only supported in custom implementation)
+            use_past_kv_cache: Whether to use KV cache
+            prepend_bos: Whether to prepend BOS token
+            padding_side: Which side to pad on
+            return_type: Type of output to return
+            verbose: Whether to show progress
+            return_logits: If True, yield tuples of (tokens, logits) instead of just tokens
+                (Note: return_logits is only supported with custom implementation, not when using
+                the original model's generate method)
+
+        Yields:
+            Generated tokens (and optionally logits) in batches
+        """
+        # Try to use the original model's generate method with streaming if available
+        if hasattr(self.original_model, "generate") and freq_penalty == 0.0 and not return_logits:
+            print("Using original model's generate method with streaming")
+            print(f"max new tokens: {max_new_tokens}")
+
+            # Create a custom streamer for batching tokens
+            class BatchedTokenStreamer:
+                def __init__(self, batch_size: int, max_tokens_per_yield: int):
+                    self.batch_size = batch_size
+                    self.max_tokens_per_yield = max_tokens_per_yield
+                    self.accumulated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
+                    self.token_queue: List[torch.Tensor] = []
+                    self.finished = False
+
+                def put(self, value: torch.Tensor) -> None:
+                    """Called by HuggingFace generate when new tokens are available."""
+                    # value shape: (batch_size, 1) typically
+                    if value.dim() == 2:
+                        for batch_idx in range(value.shape[0]):
+                            token_list = value[batch_idx].tolist()
+                            # Handle both single token and list of tokens
+                            if isinstance(token_list, list):
+                                self.accumulated_tokens[batch_idx].extend(token_list)
+                            else:
+                                self.accumulated_tokens[batch_idx].append(token_list)
+                    elif value.dim() == 1:
+                        for batch_idx in range(value.shape[0]):
+                            self.accumulated_tokens[batch_idx].append(value[batch_idx].item())
+
+                    # Check if we should yield
+                    if len(self.accumulated_tokens[0]) >= self.max_tokens_per_yield:
+                        # Convert accumulated tokens to tensor
+                        batch_tokens = torch.tensor(
+                            [tokens for tokens in self.accumulated_tokens],
+                            dtype=torch.long,
+                            device=value.device,
+                        )
+                        self.token_queue.append(batch_tokens)
+                        # Reset accumulator
+                        self.accumulated_tokens = [[] for _ in range(self.batch_size)]
+
+                def end(self) -> None:
+                    """Called by HuggingFace generate when generation is complete."""
+                    # Yield any remaining tokens
+                    if any(len(tokens) > 0 for tokens in self.accumulated_tokens):
+                        # Pad to same length if needed
+                        max_len = max(len(tokens) for tokens in self.accumulated_tokens)
+                        padded_tokens = []
+                        for tokens in self.accumulated_tokens:
+                            if len(tokens) < max_len:
+                                tokens = tokens + [0] * (max_len - len(tokens))
+                            padded_tokens.append(tokens)
+                        batch_tokens = torch.tensor(padded_tokens, dtype=torch.long)
+                        self.token_queue.append(batch_tokens)
+                    self.finished = True
+
+            # Tokenize input if needed
+            if isinstance(input, (str, list)):
+                input_ids = self.to_tokens(
+                    input, prepend_bos=prepend_bos, padding_side=padding_side
+                )
+            else:
+                input_ids = input
+
+            if input_ids.ndim == 1:
+                input_ids = input_ids.unsqueeze(0)
+
+            input_ids = input_ids.to(self.cfg.device)
+
+            batch_size = input_ids.shape[0]
+
+            # Set up generation kwargs
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+                "temperature": temperature,
+            }
+
+            # Handle KV cache parameter
+            gen_kwargs["use_cache"] = use_past_kv_cache
+
+            # Add optional parameters
+            if top_k is not None:
+                gen_kwargs["top_k"] = top_k
+            if top_p is not None:
+                gen_kwargs["top_p"] = top_p
+            if eos_token_id is not None:
+                gen_kwargs["eos_token_id"] = eos_token_id
+            elif (
+                stop_at_eos
+                and hasattr(self.tokenizer, "eos_token_id")
+                and self.tokenizer.eos_token_id is not None
+            ):
+                gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+
+            # Create and use streamer
+            streamer = BatchedTokenStreamer(batch_size, max_tokens_per_yield)
+            gen_kwargs["streamer"] = streamer
+
+            # Run generation in a separate thread (HuggingFace streamer pattern)
+            generation_kwargs = gen_kwargs.copy()
+            generation_kwargs["input_ids"] = input_ids
+
+            def generate_wrapper():
+                self.original_model.generate(**generation_kwargs)
+
+            thread = Thread(target=generate_wrapper)
+            thread.start()
+
+            import time
+
+            # Yield tokens as they become available
+            while True:
+                if streamer.token_queue:
+                    yield streamer.token_queue.pop(0)
+                elif streamer.finished:
+                    # Drain any remaining tokens in the queue
+                    while streamer.token_queue:
+                        yield streamer.token_queue.pop(0)
+                    break
+                else:
+                    time.sleep(0.01)  # Small delay to avoid busy waiting
+
+            thread.join()
+            return
+
+        # Fallback to custom implementation
+        if return_logits or freq_penalty != 0.0:
+            if hasattr(self.original_model, "generate"):
+                warnings.warn(
+                    "Using custom implementation for streaming because return_logits=True or "
+                    "freq_penalty!=0.0 which are not supported by the original model's generate.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+        # Handle input tokenization
+        if isinstance(input, (str, list)):
+            input_ids = self.to_tokens(input, prepend_bos=prepend_bos, padding_side=padding_side)
+        else:
+            input_ids = input
+
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        batch_size = input_ids.shape[0]
+        input_ids = input_ids.to(self.original_model.device)
+        device = input_ids.device
+
+        # Handle EOS token
+        stop_tokens = []
+        eos_token_for_padding = 0
+        if stop_at_eos:
+            if eos_token_id is None:
+                if (
+                    hasattr(self.tokenizer, "eos_token_id")
+                    and self.tokenizer.eos_token_id is not None
+                ):
+                    eos_token_id = self.tokenizer.eos_token_id
+                else:
+                    raise ValueError(
+                        "Must pass eos_token_id if stop_at_eos is True and tokenizer has no eos_token_id"
+                    )
+
+            if isinstance(eos_token_id, int):
+                stop_tokens = [eos_token_id]
+                eos_token_for_padding = eos_token_id
+            else:
+                stop_tokens = eos_token_id
+                eos_token_for_padding = (
+                    self.tokenizer.eos_token_id
+                    if hasattr(self.tokenizer, "eos_token_id")
+                    and self.tokenizer.eos_token_id is not None
+                    else eos_token_id[0]
+                )
+
+        # Track finished sequences
+        finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        # Initialize a TL cache object if using a HookedTransformer backend and caching is enabled
+        past_kv_cache_obj = None
+        if use_past_kv_cache and getattr(self.original_model.__class__, "__name__", "").endswith(
+            "HookedTransformer"
+        ):
+            past_kv_cache_obj = TransformerLensKeyValueCache.init_cache(
+                self.cfg, device, batch_size
+            )
+
+        # Generate tokens
+        self.eval()
+        sampled_tokens_list: list[torch.Tensor] = []
+        accumulated_tokens = None
+        accumulated_logits = None
+        tokens_since_last_yield = 0
+
+        for index in tqdm.tqdm(range(max_new_tokens), disable=not verbose):
+            # Build the current sequence (use caching by feeding only the last token when enabled)
+            if use_past_kv_cache and index > 0:
+                step_input = sampled_tokens_list[-1]
+            else:
+                step_input = (
+                    input_ids if index == 0 else torch.cat([input_ids] + sampled_tokens_list, dim=1)
+                )
+            print(f"step_input device: {step_input.device}")
+            step_input = step_input.to(self.original_model.device)
+            print(f"step_input device after to: {step_input.device}")
+
+            # Forward pass with optional KV cache (delegated to underlying model)
+            logits = self.forward(
+                step_input,
+                return_type="logits",
+                prepend_bos=prepend_bos,
+                padding_side=padding_side,
+                past_kv_cache=past_kv_cache_obj,
+                use_past_kv_cache=use_past_kv_cache,
+            )
+
+            # Get logits for the last position
+            final_logits = logits[:, -1, :]
+            print(f"final_logits device: {final_logits.device}")
+
+            # Sample next token
+            if do_sample:
+                # Build full token sequence for frequency penalty
+                if freq_penalty != 0.0:
+                    full_tokens = (
+                        torch.cat([input_ids] + sampled_tokens_list, dim=1)
+                        if sampled_tokens_list
+                        else input_ids
+                    )
+                    print(f"full_tokens device: {full_tokens.device}")
+                    sampled_tokens = utils.sample_logits(
+                        final_logits,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
+                        freq_penalty=freq_penalty,
+                        tokens=full_tokens,
+                    ).to(device)
+                else:
+                    sampled_tokens = utils.sample_logits(
+                        final_logits,
+                        top_k=top_k,
+                        top_p=top_p,
+                        temperature=temperature,
+                    ).to(device)
+            else:
+                sampled_tokens = final_logits.argmax(-1).to(device)
+
+            sampled_tokens_list.append(sampled_tokens.unsqueeze(1))
+
+            # Handle EOS tokens
+            if stop_at_eos:
+                sampled_tokens[finished_sequences] = eos_token_for_padding
+                finished_sequences.logical_or_(
+                    torch.isin(
+                        sampled_tokens.to(device),
+                        torch.tensor(stop_tokens).to(device),
+                    )
+                )
+
+            # Accumulate tokens for yielding
+            new_tokens = sampled_tokens.unsqueeze(-1)
+            new_tokens = new_tokens.to(self.original_model.device)
+            print(f"new_tokens device: {new_tokens.device}")
+            if return_logits:
+                new_logits = final_logits.unsqueeze(1)
+
+            if index == 0:
+                accumulated_tokens = torch.cat([input_ids, new_tokens], dim=-1)
+                tokens_since_last_yield = accumulated_tokens.shape[1]
+                if return_logits:
+                    accumulated_logits = new_logits
+            else:
+                if accumulated_tokens is None:
+                    accumulated_tokens = new_tokens
+                else:
+                    accumulated_tokens = torch.cat([accumulated_tokens, new_tokens], dim=-1)
+                tokens_since_last_yield += 1
+                if return_logits:
+                    if accumulated_logits is None:
+                        accumulated_logits = new_logits
+                    else:
+                        accumulated_logits = torch.cat([accumulated_logits, new_logits], dim=1)
+
+            # Yield accumulated tokens if we've reached the threshold
+            if tokens_since_last_yield >= max_tokens_per_yield:
+                if return_logits:
+                    yield (accumulated_tokens, accumulated_logits)
+                    accumulated_logits = None
+                else:
+                    yield accumulated_tokens
+                tokens_since_last_yield = 0
+                accumulated_tokens = None
+
+            # Stop if all sequences are finished
+            if stop_at_eos and finished_sequences.all():
+                # Yield any remaining accumulated tokens before breaking
+                if accumulated_tokens is not None:
+                    if return_logits:
+                        yield (accumulated_tokens, accumulated_logits)
+                    else:
+                        yield accumulated_tokens
+                break
+
+        # Yield any remaining tokens that haven't been yielded yet
+        if accumulated_tokens is not None and not (stop_at_eos and finished_sequences.all()):
+            if return_logits:
+                yield (accumulated_tokens, accumulated_logits)
+            else:
+                yield accumulated_tokens
+
+        # Handle return type conversion for final output if needed
+        if return_type == "str":
+            # For streaming, we've already yielded tokens, so this final return is for compatibility
+            full_tokens = torch.cat([input_ids] + sampled_tokens_list, dim=1)
+            decoded_texts = [
+                self.tokenizer.decode(tokens, skip_special_tokens=True) for tokens in full_tokens
+            ]
+            return decoded_texts[0] if len(decoded_texts) == 1 else decoded_texts
 
     # ==================== UTILITY METHODS ====================
 
