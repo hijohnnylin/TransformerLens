@@ -1365,6 +1365,7 @@ class TransformerBridge(nn.Module):
         padding_side: Optional[str] = None,
         return_type: Optional[str] = "input",
         verbose: bool = True,
+        extra_generation_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Union[str, List[str], torch.Tensor]:
         """Generate text from the model.
 
@@ -1427,6 +1428,9 @@ class TransformerBridge(nn.Module):
                 and self.tokenizer.eos_token_id is not None
             ):
                 gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+
+            if extra_generation_kwargs is not None:
+                gen_kwargs.update(extra_generation_kwargs)
 
             # Call the original model's generate method
             output_ids = self.original_model.generate(input_ids, **gen_kwargs)  # type: ignore[operator]
@@ -1597,6 +1601,7 @@ class TransformerBridge(nn.Module):
         return_type: Optional[str] = "input",
         verbose: bool = True,
         return_logits: bool = False,
+        extra_generation_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Generator[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], None, None]:
         """Generate text from the model with streaming output.
 
@@ -1720,6 +1725,9 @@ class TransformerBridge(nn.Module):
                 and self.tokenizer.eos_token_id is not None
             ):
                 gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+
+            if extra_generation_kwargs is not None:
+                gen_kwargs.update(extra_generation_kwargs)
 
             # Create and use streamer
             streamer = BatchedTokenStreamer(batch_size, max_tokens_per_yield)
